@@ -1,0 +1,17 @@
+build/
+*.o
+*.elf
+*.bin
+
+*.tmp
+*.log
+superos-initrd/
+
+.vscode/
+.idea/
+*.swp
+*.swo
+
+.DS_Store
+Thumbs.db
+desktop.ini

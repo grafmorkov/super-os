@@ -1,0 +1,7 @@
+load "std::io";
+using std::io;
+
+@entry i32 main() {
+    println("hello from a Quant SUPER OS user program");
+    return 0;
+}

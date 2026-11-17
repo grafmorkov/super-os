@@ -1,0 +1,113 @@
+// ============================================================================
+// SUPER OS demo user program
+// ============================================================================
+// Exercises the SUPER OS system call ABI from ring 3:
+//   write(1), read(0), sbrk(12), mmap(9), yield(24), getpid(39), exit(60)
+//
+// Build:
+//   qu --target x86_64-superos user/demo.qu -o build/demo.elf
+//
+// Run:
+//   powershell -ExecutionPolicy Bypass -File .\test-qemu.ps1 -Initrd build\demo.elf
+// ============================================================================
+
+load "std::io";
+using std::io;
+
+// print_u64 - decimal output without a formatting runtime.
+void print_u64(u64 v) {
+    if (v >= 10) {
+        print_u64(v / 10);
+    }
+    print_char((48 + (v - (v / 10) * 10)) as char);
+}
+
+// print_i64 - decimal output with a leading minus sign when negative.
+void print_i64(i64 v) {
+    if (v < 0) {
+        print_char('-');
+        print_u64((0 - v) as u64);
+    } else {
+        print_u64(v as u64);
+    }
+}
+
+// print_hex - fixed-width 16 digit hexadecimal, prefixed with 0x.
+void print_hex(u64 v) {
+    print("0x");
+    mut i64 shift = 60;
+    while (shift >= 0) {
+        u64 digit = (v >> (shift as u64)) & 15;
+        if (digit < 10) {
+            print_char((48 + digit) as char);
+        } else {
+            print_char((87 + digit) as char);
+        }
+        shift = shift - 4;
+    }
+}
+
+@entry i32 main() {
+    println("SUPER OS user demo");
+    println("------------------");
+
+    print("getpid()    = ");
+    print_i64(getpid());
+    println("");
+
+    // sbrk: grow the process break and write into the new memory.
+    i64 heap = sbrk(64);
+    print("sbrk(64)    = ");
+    print_hex(heap as u64);
+    println("");
+    if (heap > 0) {
+        str text = heap as! str;
+        text[0] = 'h';
+        text[1] = 'e';
+        text[2] = 'a';
+        text[3] = 'p';
+        text[4] = 0;
+        print("heap says   = ");
+        println(text);
+    }
+
+    // mmap: anonymous memory, write into it.
+    i64 mapped = mmap(128);
+    print("mmap(128)   = ");
+    print_hex(mapped as u64);
+    println("");
+    if (mapped > 0) {
+        str mem = mapped as! str;
+        mem[0] = 'm';
+        mem[1] = 'a';
+        mem[2] = 'p';
+        mem[3] = 0;
+        print("map says    = ");
+        println(mem);
+        munmap(mapped, 128);
+    }
+
+    // yield: give up the CPU for one scheduling slot.
+    yield();
+    println("yield()     = returned");
+
+    // read: echo one line from the console.
+    i64 line = sbrk(256);
+    if (line > 0) {
+        str buf = line as! str;
+        print("type something: ");
+        i64 n = read(buf, 255);
+        if (n > 0) {
+            buf[n] = 0;
+            print("you typed: ");
+            write(1, buf, n);
+            println("");
+        } else {
+            println("(no input)");
+        }
+    }
+
+    println("exiting with code 42");
+    exit(42);
+    return 42;
+}

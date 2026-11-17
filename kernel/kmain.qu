@@ -1,0 +1,860 @@
+// ============================================================================
+// SUPER OS - kernel entry point, console, drivers, syscalls, ELF loader, shell
+// ============================================================================
+//
+// The boot path is:
+//   QEMU (-kernel superos.elf) -> 32-bit Multiboot container (boot32.s)
+//     -> copies the flat 64-bit image to 0x200000, enables long mode
+//     -> boot64.s sets up the stack and calls kmain()
+//
+// Low-level glue (GDT/TSS/IDT/PIC/PIT/ISR stubs) lives in hw.s.
+// This file is pure Quant.
+//
+// SUPER OS system call ABI (ring 3 -> ring 0):
+//   int 0x80, number in RAX, args in RDI, RSI, RDX, R10, R8, R9,
+//   result in RAX.
+//   0 read, 1 write, 9 mmap, 11 munmap, 12 sbrk, 24 yield, 39 getpid, 60 exit
+// ============================================================================
+
+// ---------------------------------------------------------------------------
+// Assembly helpers
+// ---------------------------------------------------------------------------
+@export("outb") extern void outb(i32 port, i32 value);
+@export("outl") extern void outl(i32 port, i32 value);
+@export("inb") extern i32 inb(i32 port);
+@export("kernel_halt") extern void kernel_halt();
+@export("cpu_init") extern void cpu_init();
+@export("enable_interrupts") extern void enable_interrupts();
+@export("disable_interrupts") extern void disable_interrupts();
+@export("hlt_once") extern void hlt_once();
+@export("enter_user") extern void enter_user(u64 entry, u64 stack_top);
+@export("user_exit") extern void user_exit(i64 code);
+@export("user_get_exit_code") extern i64 user_get_exit_code();
+@export("read_cr2") extern u64 read_cr2();
+@export("get_ticks") extern u64 get_ticks();
+@export("machine_reboot") extern void machine_reboot();
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+// Fixed low-memory scratch buffers (below the 1 MiB mark).
+//  0x30000 - keyboard/serial byte ring buffer (256 bytes)
+//  0x31000 - shell input line (256 bytes)
+//  0x32000 - decimal/hex conversion scratch (64 bytes)
+//  0x33000 - general scratch
+//  0x40000 - the user image is linked at 0x400000, far above these.
+
+u64 KBUF_ADDR   = 0x30000;
+u64 LINE_ADDR   = 0x31000;
+u64 NUMBUF_ADDR = 0x32000;
+
+u64 USER_STACK_TOP = 0x600000;   // 6 MiB
+u64 HEAP_START     = 0x800000;   // 8 MiB
+u64 HEAP_LIMIT     = 0x4000000;  // 64 MiB
+
+u64 COM1 = 0x3F8;
+u64 VGA  = 0xB8000;
+i64 VGA_WIDTH  = 80;
+i64 VGA_HEIGHT = 25;
+
+// ---------------------------------------------------------------------------
+// Global state (globals are zero-initialised by the loader; every value that
+// matters is also set explicitly in kmain/console_init).
+// ---------------------------------------------------------------------------
+@init mut i64 g_vga_row;
+@init mut i64 g_vga_col;
+@init mut i64 g_color;
+@init mut i64 g_shift;
+@init mut u64 g_heap_next;
+@init mut u64 g_mb_info;
+@init mut i64 g_kb_head;
+@init mut i64 g_kb_tail;
+
+// ---------------------------------------------------------------------------
+// Raw memory access
+// ---------------------------------------------------------------------------
+u8 mem_read8(u64 a) { *u8 p = a as! *u8; return p[0]; }
+u16 mem_read16(u64 a) { *u16 p = a as! *u16; return p[0]; }
+u32 mem_read32(u64 a) { *u32 p = a as! *u32; return p[0]; }
+u64 mem_read64(u64 a) { *u64 p = a as! *u64; return p[0]; }
+
+void mem_write8(u64 a, u8 v) { *u8 p = a as! *u8; p[0] = v; }
+
+void mem_copy(u64 dst, u64 src, u64 n) {
+    *u8 d = dst as! *u8;
+    *u8 s = src as! *u8;
+    mut u64 i = 0;
+    while (i < n) {
+        d[i] = s[i];
+        i++;
+    }
+}
+
+void mem_zero(u64 dst, u64 n) {
+    *u8 d = dst as! *u8;
+    mut u64 i = 0;
+    while (i < n) {
+        d[i] = 0;
+        i++;
+    }
+}
+
+str addr_to_str(u64 a) { return a as! *char; }
+
+str str_tail(str s, i64 start) {
+    u64 base = s as! u64;
+    return (base + start as u64) as! *char;
+}
+
+i64 str_len(str s) {
+    mut i64 i = 0;
+    while (s[i] != 0) { i++; }
+    return i;
+}
+
+bool str_eq(str a, str b) {
+    mut i64 i = 0;
+    while (true) {
+        if (a[i] != b[i]) { return false; }
+        if (a[i] == 0) { return true; }
+        i++;
+    }
+    return false;
+}
+
+bool str_starts(str s, str prefix) {
+    mut i64 i = 0;
+    while (prefix[i] != 0) {
+        if (s[i] != prefix[i]) { return false; }
+        i++;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Serial port (COM1)
+// ---------------------------------------------------------------------------
+void serial_init() {
+    outb(COM1 as i32 + 1, 0x00);   // IER: interrupts off for now
+    outb(COM1 as i32 + 3, 0x80);   // DLAB
+    outb(COM1 as i32 + 0, 0x01);   // divisor = 1 -> 115200 baud
+    outb(COM1 as i32 + 1, 0x00);
+    outb(COM1 as i32 + 3, 0x03);   // 8N1
+    outb(COM1 as i32 + 2, 0x07);   // FIFO enable, clear, trigger level 1
+    outb(COM1 as i32 + 4, 0x0B);   // DTR | RTS | OUT2 (IRQ line enabled)
+    outb(COM1 as i32 + 1, 0x01);   // enable "received data available"
+}
+
+void serial_putc(char c) {
+    while ((inb(COM1 as i32 + 5) & 0x20) == 0) {}
+    outb(COM1 as i32, c as i32);
+}
+
+void serial_write_raw(str s) {
+    mut i64 i = 0;
+    while (s[i] != 0) {
+        serial_putc(s[i]);
+        i++;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// VGA text console (80x25)
+// ---------------------------------------------------------------------------
+void vga_clear() {
+    *u16 screen = VGA as! *u16;
+    mut i64 i = 0;
+    while (i < VGA_WIDTH * VGA_HEIGHT) {
+        screen[i] = 0x0F20u16;
+        i++;
+    }
+    g_vga_row = 0;
+    g_vga_col = 0;
+}
+
+void vga_scroll() {
+    *u16 screen = VGA as! *u16;
+    mut i64 i = 0;
+    while (i < VGA_WIDTH * (VGA_HEIGHT - 1)) {
+        screen[i] = screen[i + VGA_WIDTH];
+        i++;
+    }
+    while (i < VGA_WIDTH * VGA_HEIGHT) {
+        screen[i] = 0x0F20u16;
+        i++;
+    }
+}
+
+void vga_putc(char c) {
+    if (c == '\n') {
+        g_vga_col = 0;
+        g_vga_row++;
+    } else if (c == '\r') {
+        g_vga_col = 0;
+    } else if (c == 8) {
+        if (g_vga_col > 0) {
+            g_vga_col--;
+        } else if (g_vga_row > 0) {
+            g_vga_row--;
+            g_vga_col = VGA_WIDTH - 1;
+        }
+        *u16 screen = VGA as! *u16;
+        screen[g_vga_row * VGA_WIDTH + g_vga_col] = 0x0F20u16;
+    } else {
+        *u16 screen = VGA as! *u16;
+        u16 cell = ((g_color as u16) << 8) | (c as u16);
+        screen[g_vga_row * VGA_WIDTH + g_vga_col] = cell;
+        g_vga_col++;
+        if (g_vga_col >= VGA_WIDTH) {
+            g_vga_col = 0;
+            g_vga_row++;
+        }
+    }
+    while (g_vga_row >= VGA_HEIGHT) {
+        vga_scroll();
+        g_vga_row = VGA_HEIGHT - 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Console: mirrors everything to the VGA console and to COM1.
+// ---------------------------------------------------------------------------
+void console_init() {
+    g_color = 0x0F;    // white on black
+    vga_clear();
+}
+
+void console_putc(char c) {
+    serial_putc(c);
+    vga_putc(c);
+}
+
+void console_write(str s) {
+    mut i64 i = 0;
+    while (s[i] != 0) {
+        console_putc(s[i]);
+        i++;
+    }
+}
+
+void console_writeln(str s) {
+    console_write(s);
+    console_putc('\n');
+}
+
+void console_u64(u64 v) {
+    if (v == 0) {
+        console_putc('0');
+        return;
+    }
+    *u8 buf = NUMBUF_ADDR as! *u8;
+    mut i64 n = 0;
+    mut u64 x = v;
+    while (x > 0) {
+        u64 d = x / 10;
+        u64 r = x - d * 10;
+        buf[n] = (r as u8) + 48;
+        n++;
+        x = d;
+    }
+    while (n > 0) {
+        n--;
+        console_putc(buf[n] as char);
+    }
+}
+
+void console_i64(i64 v) {
+    if (v < 0) {
+        console_putc('-');
+        console_u64((0 - v) as u64);
+    } else {
+        console_u64(v as u64);
+    }
+}
+
+void console_hex(u64 v) {
+    console_write("0x");
+    if (v == 0) {
+        console_putc('0');
+        return;
+    }
+    *u8 buf = NUMBUF_ADDR as! *u8;
+    mut i64 n = 0;
+    mut u64 x = v;
+    while (x > 0) {
+        u64 d = x & 15;
+        if (d < 10) {
+            buf[n] = (d as u8) + 48;
+        } else {
+            buf[n] = (d as u8) + 87;
+        }
+        n++;
+        x = x >> 4;
+    }
+    while (n > 0) {
+        n--;
+        console_putc(buf[n] as char);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Input byte buffer shared by the PS/2 keyboard and the serial port.
+// ---------------------------------------------------------------------------
+void kb_push(i64 ch) {
+    *u8 buf = KBUF_ADDR as! *u8;
+    i64 nh = (g_kb_head + 1) & 255;
+    if (nh == g_kb_tail) { return; }   // full: drop
+    buf[g_kb_head] = ch as u8;
+    g_kb_head = nh;
+}
+
+i64 kb_pop() {
+    if (g_kb_head == g_kb_tail) { return -1; }
+    *u8 buf = KBUF_ADDR as! *u8;
+    i64 ch = buf[g_kb_tail] as i64;
+    g_kb_tail = (g_kb_tail + 1) & 255;
+    return ch;
+}
+
+// Blocks until a byte is available. The PIT keeps waking the CPU, so an
+// interrupt arriving between the buffer check and HLT cannot deadlock us.
+i64 kb_getc_blocking() {
+    while (true) {
+        serial_poll();
+        i64 c = kb_pop();
+        if (c >= 0) { return c; }
+        hlt_once();
+    }
+    return -1;
+}
+
+// ---------------------------------------------------------------------------
+// PS/2 keyboard (scan code set 1)
+// ---------------------------------------------------------------------------
+i64 scancode_ascii(i32 sc) {
+    if (sc >= 0x02 && sc <= 0x0B) {
+        if (sc == 0x0B) {
+            if (g_shift != 0) { return ')'; }
+            return '0';
+        }
+        if (g_shift != 0) {
+            if (sc == 0x02) { return '!'; }
+            if (sc == 0x03) { return '@'; }
+            if (sc == 0x04) { return '#'; }
+            if (sc == 0x05) { return '$'; }
+            if (sc == 0x06) { return '%'; }
+            if (sc == 0x07) { return '^'; }
+            if (sc == 0x08) { return '&'; }
+            if (sc == 0x09) { return '*'; }
+            if (sc == 0x0A) { return '('; }
+        }
+        return '1' + (sc - 0x02);
+    }
+
+    // qwertyuiop
+    if (sc >= 0x10 && sc <= 0x19) {
+        str row = "qwertyuiop";
+        i64 base = row[sc - 0x10] as i64;
+        if (g_shift != 0) { return base - 32; }
+        return base;
+    }
+    // asdfghjkl
+    if (sc >= 0x1E && sc <= 0x26) {
+        str row = "asdfghjkl";
+        i64 base = row[sc - 0x1E] as i64;
+        if (g_shift != 0) { return base - 32; }
+        return base;
+    }
+    // zxcvbnm
+    if (sc >= 0x2C && sc <= 0x32) {
+        str row = "zxcvbnm";
+        i64 base = row[sc - 0x2C] as i64;
+        if (g_shift != 0) { return base - 32; }
+        return base;
+    }
+
+    if (sc == 0x1C) { return '\n'; }
+    if (sc == 0x0E) { return 8; }        // backspace
+    if (sc == 0x39) { return ' '; }
+    if (sc == 0x0F) { return '\t'; }
+
+    if (sc == 0x0C) {
+        if (g_shift != 0) { return '_'; }
+        return '-';
+    }
+    if (sc == 0x0D) {
+        if (g_shift != 0) { return '+'; }
+        return '=';
+    }
+    if (sc == 0x1A) {
+        if (g_shift != 0) { return '{'; }
+        return '[';
+    }
+    if (sc == 0x1B) {
+        if (g_shift != 0) { return '}'; }
+        return ']';
+    }
+    if (sc == 0x27) {
+        if (g_shift != 0) { return ':'; }
+        return ';';
+    }
+    if (sc == 0x28) {
+        if (g_shift != 0) { return '"'; }
+        return '\'';
+    }
+    if (sc == 0x29) {
+        if (g_shift != 0) { return '~'; }
+        return '`';
+    }
+    if (sc == 0x2B) {
+        if (g_shift != 0) { return '|'; }
+        return '\\';
+    }
+    if (sc == 0x33) {
+        if (g_shift != 0) { return '<'; }
+        return ',';
+    }
+    if (sc == 0x34) {
+        if (g_shift != 0) { return '>'; }
+        return '.';
+    }
+    if (sc == 0x35) {
+        if (g_shift != 0) { return '?'; }
+        return '/';
+    }
+    return 0;
+}
+
+// Called from irq1_stub.
+@export("keyboard_irq") void keyboard_irq(i32 sc) {
+    if (sc == 0x2A || sc == 0x36) {
+        g_shift = 1;
+        return;
+    }
+    if (sc == 0xAA || sc == 0xB6) {
+        g_shift = 0;
+        return;
+    }
+    if ((sc & 0x80) != 0) { return; }     // release
+    i64 ch = scancode_ascii(sc);
+    if (ch != 0) { kb_push(ch); }
+}
+
+// Called from irq4_stub (COM1 receive).
+@export("serial_irq") void serial_irq(i32 c) {
+    if (c == 13 || c == 10) {
+        kb_push(10);
+        return;
+    }
+    if (c == 127 || c == 8) {
+        kb_push(8);
+        return;
+    }
+    if (c >= 32 && c < 127) {
+        kb_push(c as i64);
+    }
+}
+
+// Drain any bytes sitting in the UART receive FIFO.
+//
+// The 16550 asserts a level-triggered IRQ, but the 8259 is programmed for
+// edge-triggered ISA interrupts, so a byte arriving while the line is already
+// high can miss its interrupt. Polling here recovers those bytes.
+void serial_poll() {
+    while ((inb(COM1 as i32 + 5) & 1) != 0) {
+        serial_irq(inb(COM1 as i32));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Line editing
+// ---------------------------------------------------------------------------
+// Read a line into a user buffer. Returns the number of bytes stored
+// (including the trailing newline when one was typed). Used by read(2).
+i64 read_user_line(u64 buf, i64 len) {
+    if (len <= 0) { return 0; }
+    *u8 out = buf as! *u8;
+    mut i64 n = 0;
+    while (true) {
+        i64 c = kb_getc_blocking();
+        if (c == 10) {
+            console_putc('\n');
+            if (n < len) {
+                out[n] = 10;
+                n++;
+            }
+            return n;
+        }
+        if (c == 8) {
+            if (n > 0) {
+                n--;
+                console_putc(8);
+                console_putc(' ');
+                console_putc(8);
+            }
+            continue;
+        }
+        if (c >= 32 && c < 127) {
+            if (n + 1 < len) {
+                out[n] = c as u8;
+                n++;
+                console_putc(c as char);
+            }
+        }
+    }
+    return n;
+}
+
+// Read a line into the shell buffer (no newline, NUL terminated).
+i64 shell_read_line() {
+    *u8 buf = LINE_ADDR as! *u8;
+    mut i64 n = 0;
+    while (true) {
+        i64 c = kb_getc_blocking();
+        if (c == 10) {
+            console_putc('\n');
+            buf[n] = 0;
+            return n;
+        }
+        if (c == 8) {
+            if (n > 0) {
+                n--;
+                console_putc(8);
+                console_putc(' ');
+                console_putc(8);
+            }
+            continue;
+        }
+        if (c >= 32 && c < 127) {
+            if (n < 255) {
+                buf[n] = c as u8;
+                n++;
+                console_putc(c as char);
+            }
+        }
+    }
+    buf[n] = 0;
+    return n;
+}
+
+// ---------------------------------------------------------------------------
+// Heap: a single bump allocator shared by mmap() and sbrk().
+// ---------------------------------------------------------------------------
+u64 heap_alloc(u64 size) {
+    if (size == 0) { return HEAP_START; }
+    mut u64 start = g_heap_next;
+    // align to 16 bytes
+    start = ((start + 15) / 16) * 16;
+    u64 end = start + size;
+    if (end > HEAP_LIMIT) { return 0; }
+    g_heap_next = end;
+    return start;
+}
+
+// ---------------------------------------------------------------------------
+// Syscalls
+// ---------------------------------------------------------------------------
+i64 sys_write_impl(u64 fd, u64 buf, u64 len) {
+    if (fd != 1 && fd != 2) { return -9; }     // EBADF
+    *u8 p = buf as! *u8;
+    mut u64 i = 0;
+    while (i < len) {
+        console_putc(p[i] as char);
+        i++;
+    }
+    return len as i64;
+}
+
+i64 sys_read_impl(u64 fd, u64 buf, u64 len) {
+    if (fd != 0) { return -9; }                // EBADF
+    return read_user_line(buf, len as i64);
+}
+
+i64 sys_mmap_impl(u64 addr, u64 len, u64 prot, u64 flags, u64 fd, u64 off) {
+    if (len == 0) { return -22; }              // EINVAL
+    u64 p = heap_alloc(len);
+    if (p == 0) { return -12; }                // ENOMEM
+    return p as i64;
+}
+
+i64 sys_sbrk_impl(i64 inc) {
+    u64 old = g_heap_next;
+    if (inc < 0) {
+        u64 dec = (0 - inc) as u64;
+        if (dec > old) { return -12; }
+        g_heap_next = old - dec;
+        return old as i64;
+    }
+    u64 p = heap_alloc(inc as u64);
+    if (p == 0) { return -12; }
+    // heap_alloc may align; sbrk returns the previous break.
+    return old as i64;
+}
+
+// Register frame indices (see SAVE_REGS in hw.s):
+//   0 r15  1 r14  2 r13  3 r12  4 r11  5 r10  6 r9  7 r8
+//   8 rbp  9 rdi 10 rsi 11 rdx 12 rcx 13 rbx 14 rax
+@export("syscall_handler") void syscall_handler(u64 frame) {
+    *u64 f = frame as! *u64;
+    u64 num = f[14];
+    u64 a1 = f[9];
+    u64 a2 = f[10];
+    u64 a3 = f[11];
+    u64 a4 = f[5];
+    u64 a5 = f[7];
+    u64 a6 = f[6];
+
+    mut i64 ret = 0;
+
+    if (num == 0) {
+        ret = sys_read_impl(a1, a2, a3);
+    } else if (num == 1) {
+        ret = sys_write_impl(a1, a2, a3);
+    } else if (num == 9) {
+        ret = sys_mmap_impl(a1, a2, a3, a4, a5, a6);
+    } else if (num == 11) {
+        ret = 0;                                  // munmap: no-op
+    } else if (num == 12) {
+        ret = sys_sbrk_impl(a1 as i64);
+    } else if (num == 24) {
+        hlt_once();                               // yield
+        ret = 0;
+    } else if (num == 39) {
+        ret = 1;                                  // single process
+    } else if (num == 60) {
+        user_exit(a1 as i64);
+        ret = 0;
+    } else {
+        ret = -38;                                // ENOSYS
+    }
+
+    f[14] = ret as u64;
+}
+
+// ---------------------------------------------------------------------------
+// CPU fault handler (called from exc_stub)
+// ---------------------------------------------------------------------------
+@export("kernel_exception") void kernel_exception(u64 cr2) {
+    serial_write_raw("\n*** SUPER OS: CPU exception ***\n");
+    serial_write_raw("faulting address (CR2): ");
+    // Minimal hex dump straight to the UART, independent of console state.
+    serial_write_raw("0x");
+    mut i64 i = 60;
+    while (i >= 0) {
+        u64 d = (cr2 >> (i as u64)) & 15;
+        if (d < 10) {
+            serial_putc((d as u8 + 48) as char);
+        } else {
+            serial_putc((d as u8 + 87) as char);
+        }
+        i = i - 4;
+    }
+    serial_write_raw("\nsystem halted\n");
+    kernel_halt();
+}
+
+// ---------------------------------------------------------------------------
+// ELF64 loader
+// ---------------------------------------------------------------------------
+u64 elf_load(u64 base, u64 size) {
+    if (size < 64) { return 0; }
+    if (mem_read32(base) != 0x464C457Fu) { return 0; }  // 0x7F 'E' 'L' 'F'
+    if (mem_read8(base + 4) != 2) { return 0; }         // ELFCLASS64
+    u64 entry    = mem_read64(base + 24);
+    u64 phoff    = mem_read64(base + 32);
+    u16 phentsz  = mem_read16(base + 54);
+    u16 phnum    = mem_read16(base + 56);
+
+    mut i64 i = 0;
+    while (i < phnum as i64) {
+        u64 ph = base + phoff + (i as u64) * (phentsz as u64);
+        u32 typ = mem_read32(ph);
+        if (typ == 1u) {                                // PT_LOAD
+            u64 off    = mem_read64(ph + 8);
+            u64 vaddr  = mem_read64(ph + 16);
+            u64 filesz = mem_read64(ph + 32);
+            u64 memsz  = mem_read64(ph + 40);
+            if (filesz > 0) {
+                mem_copy(vaddr, base + off, filesz);
+            }
+            if (memsz > filesz) {
+                mem_zero(vaddr + filesz, memsz - filesz);
+            }
+        }
+        i++;
+    }
+    return entry;
+}
+
+u64 mb_module_start(u64 info) {
+    u64 mods = mem_read32(info + 24) as u64;
+    return mem_read32(mods) as u64;
+}
+
+u64 mb_module_size(u64 info) {
+    u64 mods = mem_read32(info + 24) as u64;
+    u64 start = mem_read32(mods) as u64;
+    u64 end = mem_read32(mods + 4) as u64;
+    return end - start;
+}
+
+u64 mb_module_count(u64 info) {
+    return mem_read32(info + 20) as u64;
+}
+
+// ---------------------------------------------------------------------------
+// Running a ring-3 program from the Multiboot module (-initrd)
+// ---------------------------------------------------------------------------
+void run_initrd_program() {
+    if (g_mb_info == 0) {
+        console_writeln("no multiboot information");
+        return;
+    }
+    if ((mem_read32(g_mb_info) as i64 & 8) == 0) {
+        console_writeln("no initrd module was loaded");
+        return;
+    }
+    u64 count = mb_module_count(g_mb_info);
+    if (count == 0) {
+        console_writeln("initrd contains no modules");
+        return;
+    }
+
+    u64 start = mb_module_start(g_mb_info);
+    u64 size = mb_module_size(g_mb_info);
+    console_write("loading ELF from ");
+    console_hex(start);
+    console_write(" (");
+    console_u64(size);
+    console_writeln(" bytes)");
+
+    u64 entry = elf_load(start, size);
+    if (entry == 0) {
+        console_writeln("not a valid ELF64 executable");
+        return;
+    }
+
+    g_heap_next = HEAP_START;
+    console_write("entering ring 3 at ");
+    console_hex(entry);
+    console_writeln(" ...");
+
+    enter_user(entry, USER_STACK_TOP);
+    enable_interrupts();
+
+    console_write("[program exited with code ");
+    console_i64(user_get_exit_code());
+    console_writeln("]");
+}
+
+// ---------------------------------------------------------------------------
+// Shell
+// ---------------------------------------------------------------------------
+void shell_help() {
+    console_writeln("SUPER OS shell commands:");
+    console_writeln("  help        - this text");
+    console_writeln("  run         - load and run the ELF passed with -initrd");
+    console_writeln("  echo TEXT   - print TEXT");
+    console_writeln("  clear       - clear the screen");
+    console_writeln("  ver         - version banner");
+    console_writeln("  mem         - heap state");
+    console_writeln("  ticks       - PIT ticks since boot");
+    console_writeln("  reboot      - hard reboot");
+    console_writeln("  poweroff    - exit QEMU (isa-debug-exit)");
+}
+
+void shell_exec(str line) {
+    if (line[0] == 0) { return; }
+    if (str_eq(line, "help")) {
+        shell_help();
+    } else if (str_eq(line, "run") || str_eq(line, "exec") || str_eq(line, "hello")) {
+        run_initrd_program();
+    } else if (str_eq(line, "clear")) {
+        vga_clear();
+    } else if (str_eq(line, "ver")) {
+        console_writeln("SUPER OS 0.1 - a Quant operating system (x86-64, ring 3)");
+    } else if (str_eq(line, "mem")) {
+        console_write("heap next:    ");
+        console_hex(g_heap_next);
+        console_writeln("");
+        console_write("heap limit:   ");
+        console_hex(HEAP_LIMIT);
+        console_writeln("");
+        console_write("user stack:   ");
+        console_hex(USER_STACK_TOP);
+        console_writeln("");
+    } else if (str_eq(line, "ticks")) {
+        console_write("ticks: ");
+        console_u64(get_ticks());
+        console_writeln("");
+    } else if (str_eq(line, "reboot")) {
+        machine_reboot();
+    } else if (str_eq(line, "poweroff")) {
+        console_writeln("powering off...");
+        outl(0x501, 0x00);          // QEMU isa-debug-exit
+        outl(0x604, 0x2000);        // ACPI fallback
+        kernel_halt();
+    } else if (str_starts(line, "echo ")) {
+        console_writeln(str_tail(line, 5));
+    } else {
+        console_write("unknown command: ");
+        console_writeln(line);
+        console_writeln("type 'help' for a list of commands");
+    }
+}
+
+void shell_loop() {
+    console_writeln("");
+    console_writeln("Type 'help' for a list of commands.");
+    while (true) {
+        console_write("superos> ");
+        shell_read_line();
+        str line = LINE_ADDR as! *char;
+        shell_exec(line);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kernel entry point
+// ---------------------------------------------------------------------------
+@export("kmain") void kmain(u64 mb_info) {
+    g_mb_info = mb_info;
+    g_kb_head = 0;
+    g_kb_tail = 0;
+    g_shift = 0;
+    g_heap_next = HEAP_START;
+
+    cpu_init();
+    serial_init();
+    console_init();
+
+    console_writeln("SUPER OS 0.1");
+    console_writeln("Quant kernel booted in long mode (x86-64)");
+    console_write("Multiboot info: ");
+    console_hex(mb_info);
+    console_writeln("");
+
+    if (mb_info != 0 && (mem_read32(mb_info) as i64 & 8) != 0) {
+        u64 count = mb_module_count(mb_info);
+        if (count > 0) {
+            u64 start = mb_module_start(mb_info);
+            u64 size = mb_module_size(mb_info);
+            console_write("initrd module: ");
+            console_hex(start);
+            console_write(" (");
+            console_u64(size);
+            console_writeln(" bytes)");
+        }
+    }
+
+    enable_interrupts();
+
+    // If a user program was supplied, run it once automatically so a plain
+    // `qemu -kernel ... -initrd hello.elf` immediately demonstrates ring 3.
+    if (mb_info != 0 && (mem_read32(mb_info) as i64 & 8) != 0
+        && mb_module_count(mb_info) > 0) {
+        run_initrd_program();
+    }
+
+    shell_loop();
+}
